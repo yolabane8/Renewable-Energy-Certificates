@@ -10,12 +10,17 @@
 (define-constant err-cert-expired (err u106))
 (define-constant err-contract-paused (err u107))
 (define-constant err-invalid-date (err u108))
+(define-constant err-insufficient-payment (err u109))
+(define-constant err-not-for-sale (err u110))
+(define-constant err-invalid-price (err u111))
 
 (define-data-var next-certificate-id uint u1)
 (define-data-var total-certificates uint u0)
 (define-data-var total-mwh-issued uint u0)
 (define-data-var total-mwh-retired uint u0)
 (define-data-var contract-paused bool false)
+(define-data-var trading-volume-stx uint u0)
+(define-data-var total-trades uint u0)
 
 (define-map authorized-issuers
     principal
@@ -55,6 +60,35 @@
 (define-map energy-type-registry
     (string-ascii 50)
     bool
+)
+(define-map certificate-prices
+    uint
+    {
+        price-ustx: uint,
+        for-sale: bool,
+        listed-at: uint,
+    }
+)
+(define-map trading-history
+    uint
+    {
+        certificate-id: uint,
+        seller: principal,
+        buyer: principal,
+        price-ustx: uint,
+        trade-timestamp: uint,
+        energy-type: (string-ascii 50),
+        mwh-amount: uint,
+    }
+)
+(define-map market-statistics
+    (string-ascii 50)
+    {
+        total-volume-stx: uint,
+        total-trades: uint,
+        last-sale-price: uint,
+        avg-price-per-mwh: uint,
+    }
 )
 
 (define-public (add-authorized-issuer (issuer principal))
@@ -228,6 +262,31 @@
             active-certificates: (if is-new
                 (+ (get active-certificates current-stats) u1)
                 (- (get active-certificates current-stats) u1)
+            ),
+        })
+    )
+)
+
+(define-private (update-market-stats
+        (energy-type (string-ascii 50))
+        (sale-price uint)
+        (mwh-amount uint)
+    )
+    (let ((current-stats (default-to {
+            total-volume-stx: u0,
+            total-trades: u0,
+            last-sale-price: u0,
+            avg-price-per-mwh: u0,
+        }
+            (map-get? market-statistics energy-type)
+        )))
+        (map-set market-statistics energy-type {
+            total-volume-stx: (+ (get total-volume-stx current-stats) sale-price),
+            total-trades: (+ (get total-trades current-stats) u1),
+            last-sale-price: sale-price,
+            avg-price-per-mwh: (if (> mwh-amount u0)
+                (/ sale-price mwh-amount)
+                u0
             ),
         })
     )
@@ -501,6 +560,87 @@
     )
 )
 
+(define-public (list-certificate-for-sale
+        (certificate-id uint)
+        (price-ustx uint)
+    )
+    (let (
+            (current-owner (unwrap! (nft-get-owner? renewable-energy-certificate certificate-id)
+                err-not-found
+            ))
+            (cert-data (unwrap! (map-get? certificate-data certificate-id) err-not-found))
+        )
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
+        (asserts! (is-eq tx-sender current-owner) err-not-token-owner)
+        (asserts! (not (get retired cert-data)) err-already-retired)
+        (asserts! (> price-ustx u0) err-invalid-price)
+
+        (map-set certificate-prices certificate-id {
+            price-ustx: price-ustx,
+            for-sale: true,
+            listed-at: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (delist-certificate (certificate-id uint))
+    (let ((current-owner (unwrap! (nft-get-owner? renewable-energy-certificate certificate-id)
+            err-not-found
+        )))
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
+        (asserts! (is-eq tx-sender current-owner) err-not-token-owner)
+
+        (map-delete certificate-prices certificate-id)
+        (ok true)
+    )
+)
+
+(define-public (purchase-certificate (certificate-id uint))
+    (let (
+            (current-owner (unwrap! (nft-get-owner? renewable-energy-certificate certificate-id)
+                err-not-found
+            ))
+            (cert-data (unwrap! (map-get? certificate-data certificate-id) err-not-found))
+            (price-data (unwrap! (map-get? certificate-prices certificate-id)
+                err-not-for-sale
+            ))
+            (trade-id (var-get total-trades))
+        )
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
+        (asserts! (get for-sale price-data) err-not-for-sale)
+        (asserts! (not (is-eq tx-sender current-owner)) err-not-token-owner)
+        (asserts! (not (get retired cert-data)) err-already-retired)
+
+        (try! (stx-transfer? (get price-ustx price-data) tx-sender current-owner))
+        (try! (nft-transfer? renewable-energy-certificate certificate-id current-owner
+            tx-sender
+        ))
+
+        (map-set trading-history trade-id {
+            certificate-id: certificate-id,
+            seller: current-owner,
+            buyer: tx-sender,
+            price-ustx: (get price-ustx price-data),
+            trade-timestamp: burn-block-height,
+            energy-type: (get energy-type cert-data),
+            mwh-amount: (get mwh-amount cert-data),
+        })
+
+        (var-set total-trades (+ trade-id u1))
+        (var-set trading-volume-stx
+            (+ (var-get trading-volume-stx) (get price-ustx price-data))
+        )
+
+        (update-market-stats (get energy-type cert-data)
+            (get price-ustx price-data) (get mwh-amount cert-data)
+        )
+        (map-delete certificate-prices certificate-id)
+
+        (ok true)
+    )
+)
+
 (define-read-only (get-market-summary)
     (let (
             (active-mwh (- (var-get total-mwh-issued) (var-get total-mwh-retired)))
@@ -521,8 +661,13 @@
 
 (define-read-only (calculate-user-portfolio (user principal))
     (fold sum-user-certificates
-        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19
-            u20)
+        (list
+            u1             u2             u3             u4             u5
+                        u6             u7             u8             u9             u10
+                        u11             u12             u13             u14             u15
+                        u16             u17             u18             u19
+            u20
+        )
         u0
     )
 )
@@ -602,6 +747,59 @@
             retired: false,
             vintage: u0,
         }
+    )
+)
+
+(define-read-only (get-certificate-price (certificate-id uint))
+    (map-get? certificate-prices certificate-id)
+)
+
+(define-read-only (get-trade-history (trade-id uint))
+    (map-get? trading-history trade-id)
+)
+
+(define-read-only (get-market-stats (energy-type (string-ascii 50)))
+    (default-to {
+        total-volume-stx: u0,
+        total-trades: u0,
+        last-sale-price: u0,
+        avg-price-per-mwh: u0,
+    }
+        (map-get? market-statistics energy-type)
+    )
+)
+
+(define-read-only (get-trading-overview)
+    {
+        total-volume-stx: (var-get trading-volume-stx),
+        total-trades: (var-get total-trades),
+        market-active: (not (var-get contract-paused)),
+    }
+)
+
+(define-read-only (get-certificate-with-price (certificate-id uint))
+    (let (
+            (cert-data (map-get? certificate-data certificate-id))
+            (price-data (map-get? certificate-prices certificate-id))
+        )
+        (match cert-data
+            cert
+            {
+                certificate: (some cert),
+                owner: (nft-get-owner? renewable-energy-certificate certificate-id),
+                price-info: price-data,
+                for-sale: (match price-data
+                    price (get for-sale price)
+                    false
+                ),
+            }
+            {
+                certificate: none,
+                owner: none,
+                price-info: none,
+                for-sale: false,
+            }
+        )
     )
 )
 

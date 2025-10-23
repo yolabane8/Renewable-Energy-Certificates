@@ -81,6 +81,14 @@
         mwh-amount: uint,
     }
 )
+(define-map certificate-metadata
+    uint
+    {
+        uri: (string-utf8 256),
+        updated-at: uint,
+        updated-by: principal,
+    }
+)
 (define-map market-statistics
     (string-ascii 50)
     {
@@ -801,6 +809,34 @@
             }
         )
     )
+)
+
+(define-public (set-certificate-uri
+        (certificate-id uint)
+        (uri (string-utf8 256))
+    )
+    (let (
+            (cert-data (unwrap! (map-get? certificate-data certificate-id) err-not-found))
+            (current-owner (unwrap! (nft-get-owner? renewable-energy-certificate certificate-id)
+                err-not-found
+            ))
+            (issuer (get issuer cert-data))
+        )
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
+        (asserts! (or (is-eq tx-sender current-owner) (is-eq tx-sender issuer))
+            err-unauthorized-issuer
+        )
+        (map-set certificate-metadata certificate-id {
+            uri: uri,
+            updated-at: burn-block-height,
+            updated-by: tx-sender,
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-certificate-uri (certificate-id uint))
+    (map-get? certificate-metadata certificate-id)
 )
 
 (begin
